@@ -127,7 +127,7 @@ class FreeBetEnv:
         return self.ACTIONS[best_idx]
 
     # ----- One round with RL transitions -----
-    def play_round(self, q: Dict, eps: float):
+    def play_round(self, qtab, eps: float, tc: int = 0):
         player_cards, dealer_cards = self.initial_deal()
         dealer_up = dealer_cards[1]
 
@@ -164,8 +164,11 @@ class FreeBetEnv:
             while True:
                 avail = self.available_actions(hand, dealer_up)
                 state = self.state_key(hand.cards, dealer_up, hand.first_action)
-                _ = q[state]
-                act = self.choose_action(q, state, avail, eps)
+
+                # ✅ Avant : _ = q[state]
+                _ = qtab.q_by_tc[tc][state]  # initialise les qvals si absent
+
+                act = qtab.choose_action(state, avail, eps, tc)
                 a_idx = self.ACT_TO_IDX[act]
                 round_transitions[i].append((state, a_idx))
 

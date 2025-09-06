@@ -21,14 +21,15 @@ SAVE_PATH = "qtable.pkl"
 
 def save_qtable(qtab, path=SAVE_PATH):
     data = {
-        "qtable": dict(qtab.q),
-        "episodes": st.session_state.episodes,
-        "returns_sum": st.session_state.returns_sum,
-        "stats": dict(st.session_state.stats),
-        "sessions": st.session_state.env.shoe.sessions_played,
+        # on sérialise toutes les Q-tables par TC
+        "q_by_tc": {tc: dict(qtab.q_by_tc[tc]) for tc in qtab.q_by_tc},
+        "visits_by_tc": {tc: dict(qtab.visits_by_tc[tc]) for tc in qtab.visits_by_tc},
+        "episodes": qtab.episodes,
+        "epsilon": qtab.epsilon,
     }
     with open(path, "wb") as f:
         pickle.dump(data, f)
+
 
 def load_qtable(qtab, path=SAVE_PATH):
     try:
@@ -36,15 +37,23 @@ def load_qtable(qtab, path=SAVE_PATH):
             return
         with open(path, "rb") as f:
             data = pickle.load(f)
-        # restaurer Q-table
-        qtab.q = defaultdict(lambda: np.zeros(4), data["qtable"])
-        # restaurer métriques
-        st.session_state.episodes = data.get("episodes", 0)
-        st.session_state.returns_sum = data.get("returns_sum", 0.0)
-        st.session_state.stats = Counter(data.get("stats", {}))
-        st.session_state.env.shoe.sessions_played = data.get("sessions", 0)
+
+        # Restaurer les q_by_tc
+        qtab.q_by_tc = defaultdict(lambda: defaultdict(lambda: np.zeros(4)))
+        for tc, qdict in data.get("q_by_tc", {}).items():
+            qtab.q_by_tc[tc] = defaultdict(lambda: np.zeros(4), qdict)
+
+        # Restaurer les visits_by_tc
+        qtab.visits_by_tc = defaultdict(lambda: defaultdict(lambda: np.zeros(4, dtype=int)))
+        for tc, vdict in data.get("visits_by_tc", {}).items():
+            qtab.visits_by_tc[tc] = defaultdict(lambda: np.zeros(4, dtype=int), vdict)
+
+        qtab.episodes = data.get("episodes", 0)
+        qtab.epsilon = data.get("epsilon", qtab.epsilon)
+
     except (FileNotFoundError, EOFError, pickle.UnpicklingError):
         pass
+
     
 
 # ------------------------------ Init Session State ------------------------------
@@ -97,13 +106,16 @@ with c3:
         eps = st.session_state.settings['epsilon']
         alpha = st.session_state.settings['alpha']
         for _ in range(int(st.session_state.settings['episodes_per_tick'])):
-            trans, rewards, outcomes = env.play_round(qtab.q, eps)
+            tc = max(-5, min(5, env.shoe.true_count()))
+            trans, rewards, outcomes = env.play_round(qtab, eps, tc)
+
             G = sum(rewards)
             if trans:
-                qtab.update_episode(trans, G, alpha)
+                qtab.update_episode(trans, G, alpha, tc)
             st.session_state.episodes += 1
             st.session_state.returns_sum += G
             st.session_state.stats.update(outcomes)
+            qtab.update_episode(trans, G, alpha, tc)
 
 with c4:
     if st.button("💾 Save Q-Table"):
@@ -124,14 +136,15 @@ if st.session_state.running:
 
     while st.session_state.running:
         for _ in range(int(st.session_state.settings['episodes_per_tick'])):
-            trans, rewards, outcomes = env.play_round(qtab.q, eps)
+            tc = max(-5, min(5, env.shoe.true_count()))
+            trans, rewards, outcomes = env.play_round(qtab, eps, tc)
+
             G = sum(rewards)
             if trans:
-                qtab.update_episode(trans, G, alpha)
+                qtab.update_episode(trans, G, alpha, tc)
             st.session_state.episodes += 1
             st.session_state.returns_sum += G
             st.session_state.stats.update(outcomes)
-        # ⚠️ pas de st.rerun() → l’UI ne bouge pas tant que Pause n’est pas cliqué
 
 # ------------------------------ Metrics ------------------------------
 st.subheader("📈 Training Metrics")
@@ -163,22 +176,24 @@ with colF:
 st.divider()
 
 # ------------------------------ Strategy Tables ------------------------------
-st.subheader("🧠 Learned Best Actions (style basic strategy)")
+st.subheader("🧠 Learned Best Actions (multi-tables par True Count)")
+
+tc_choice = st.slider("True Count (TC)", -5, 5, 0)
 
 show_percentages = st.checkbox("Afficher les pourcentages D/H/S/P", value=False)
 
 htab1, htab2, htab3 = st.tabs(["Hard totals", "Soft totals", "Pairs"])
 
 with htab1:
-    df_hard = build_table_hard(st.session_state.qtab, st.session_state.env, show_percentages)
+    df_hard = build_table_hard(st.session_state.qtab, st.session_state.env, tc_choice, show_percentages)
     st.dataframe(style_actions(df_hard), use_container_width=True, hide_index=True)
 
 with htab2:
-    df_soft = build_table_soft(st.session_state.qtab, st.session_state.env, show_percentages)
+    df_soft = build_table_soft(st.session_state.qtab, st.session_state.env, tc_choice, show_percentages)
     st.dataframe(style_actions(df_soft), use_container_width=True, hide_index=True)
 
 with htab3:
-    df_pairs = build_table_pairs(st.session_state.qtab, st.session_state.env, show_percentages)
+    df_pairs = build_table_pairs(st.session_state.qtab, st.session_state.env, tc_choice, show_percentages)
     st.dataframe(style_actions(df_pairs), use_container_width=True, hide_index=True)
 
 st.caption(
