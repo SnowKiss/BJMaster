@@ -6,8 +6,8 @@ import signal
 import time
 import sys
 import multiprocessing as mp
-from collections import defaultdict, Counter
-from typing import Dict, Tuple, Any
+from collections import defaultdict
+from typing import Dict, Any
 
 import numpy as np
 
@@ -15,6 +15,7 @@ from freebet.env import FreeBetEnv
 from freebet.rl.qtable import QTable
 
 SAVE_PATH_DEFAULT = "qtable.pkl"
+
 
 # --------------------- Utils: QTable <-> dict ---------------------
 def qtable_to_dict(qtab: QTable) -> dict:
@@ -24,6 +25,7 @@ def qtable_to_dict(qtab: QTable) -> dict:
         "episodes": int(qtab.episodes),
         "epsilon": float(getattr(qtab, "epsilon", 0.0)),
     }
+
 
 def dict_to_qtable(d: dict) -> QTable:
     qtab = QTable()
@@ -37,9 +39,11 @@ def dict_to_qtable(d: dict) -> QTable:
     qtab.epsilon = float(d.get("epsilon", getattr(qtab, "epsilon", 0.0)))
     return qtab
 
+
 def save_qtable(qtab: QTable, path: str) -> None:
     with open(path, "wb") as f:
         pickle.dump(qtable_to_dict(qtab), f)
+
 
 def load_qtable(path: str) -> QTable:
     qtab = QTable()
@@ -52,6 +56,36 @@ def load_qtable(path: str) -> QTable:
     except Exception:
         return qtab
 
+
+# --------------------- CLI helper: parse --tc-only ---------------------
+def parse_tc_only(spec: str):
+    """
+    Parse a CSV or range spec into a sorted list of TC integers clipped to [-5, 5].
+      - "" -> None (means 'all TC')
+      - "4,5" -> [4, 5]
+      - "4:5" -> [4, 5]
+      - "-2:3,5" -> [-2, -1, 0, 1, 2, 3, 5]
+    """
+    if not spec:
+        return None
+    vals = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            a, b = part.split(":")
+            a, b = int(a), int(b)
+            if a > b:
+                a, b = b, a
+            for v in range(a, b + 1):
+                vals.add(max(-5, min(5, v)))
+        else:
+            v = int(part)
+            vals.add(max(-5, min(5, v)))
+    return sorted(vals)
+
+
 # --------------------- Outcome helpers ---------------------
 def is_win(outcomes) -> bool:
     if isinstance(outcomes, str):
@@ -60,12 +94,14 @@ def is_win(outcomes) -> bool:
         return bool(outcomes.get("win"))
     return False
 
+
 def is_push(outcomes) -> bool:
     if isinstance(outcomes, str):
         return outcomes == "push"
     if isinstance(outcomes, dict):
         return bool(outcomes.get("push"))
     return False
+
 
 # --------------------- Worker ---------------------
 def snapshot_visits(visits_by_tc) -> Dict[int, Dict[Any, np.ndarray]]:
@@ -76,6 +112,7 @@ def snapshot_visits(visits_by_tc) -> Dict[int, Dict[Any, np.ndarray]]:
             out_tc[s] = v.copy()
         out[tc] = out_tc
     return out
+
 
 def visits_delta(curr, prev) -> Dict[int, Dict[Any, np.ndarray]]:
     out = {}
@@ -90,6 +127,7 @@ def visits_delta(curr, prev) -> Dict[int, Dict[Any, np.ndarray]]:
                 out.setdefault(tc, {})[s] = delta.astype(int, copy=False)
     return out
 
+
 def extract_q_for_states(q_by_tc, keys_dict) -> Dict[int, Dict[Any, np.ndarray]]:
     out = {}
     for tc, dd in keys_dict.items():
@@ -98,6 +136,7 @@ def extract_q_for_states(q_by_tc, keys_dict) -> Dict[int, Dict[Any, np.ndarray]]
             if q is not None:
                 out.setdefault(tc, {})[s] = q
     return out
+
 
 def worker_proc(wid: int, cfg: dict, out_q: mp.Queue, stop_ev: mp.Event):
     # init env & qtab
@@ -114,8 +153,9 @@ def worker_proc(wid: int, cfg: dict, out_q: mp.Queue, stop_ev: mp.Event):
 
     alpha = cfg["alpha"]
     report_eps = cfg["report_eps"]
+    allowed_tcs = set(cfg["tc_only"]) if cfg.get("tc_only") else None  # None => train on all TCs
 
-    # stats
+    # stats (count only trained episodes)
     wins = pushes = losses = 0
     returns_sum = 0.0
     episodes_since_last = 0
@@ -123,30 +163,35 @@ def worker_proc(wid: int, cfg: dict, out_q: mp.Queue, stop_ev: mp.Event):
     last_visits_snapshot = snapshot_visits(qtab.visits_by_tc)
 
     while not stop_ev.is_set():
-        # run a small batch
+        # run a small batch of hands (we always play to advance the shoe/TC)
         for _ in range(report_eps):
             if stop_ev.is_set():
                 break
-            tc = max(-5, min(5, env.shoe.true_count()))
+            tc = max(-5, min(5, int(env.shoe.true_count())))
             trans, rewards, outcomes = env.play_round(qtab, qtab.epsilon, tc)
-            G = 0.0
-            for r in rewards:
-                G += r
-            if trans:
+            G = float(sum(rewards)) if rewards else 0.0
+
+            # Train only if TC in filter (or no filter)
+            train_this = (allowed_tcs is None) or (tc in allowed_tcs)
+
+            if train_this and trans:
                 qtab.update_episode(trans, G, alpha, tc)
 
-            episodes_since_last += 1
-            returns_sum += G
-            if is_win(outcomes):
-                wins += 1
-            elif is_push(outcomes):
-                pushes += 1
-            else:
-                losses += 1
+                # Count stats/episodes only for trained rounds
+                episodes_since_last += 1
+                returns_sum += G
+                if is_win(outcomes):
+                    wins += 1
+                elif is_push(outcomes):
+                    pushes += 1
+                else:
+                    losses += 1
 
-        # build delta
+        # Build delta of visits (since last snapshot)
         curr_visits = qtab.visits_by_tc
         v_add = visits_delta(curr_visits, last_visits_snapshot)
+
+        # Only flush if we actually trained something
         if episodes_since_last > 0 and v_add:
             q_partial = extract_q_for_states(qtab.q_by_tc, v_add)
             payload = {
@@ -157,9 +202,8 @@ def worker_proc(wid: int, cfg: dict, out_q: mp.Queue, stop_ev: mp.Event):
                 "wins": wins,
                 "push": pushes,
                 "loss": losses,
-                # Garder les arrays:
-                "visits_add": v_add,        # dict[int] -> dict[state] -> np.ndarray(int, shape=(4,))
-                "q_by_tc": q_partial,       # dict[int] -> dict[state] -> np.ndarray(float, shape=(4,))
+                "visits_add": v_add,   # dict[int] -> dict[state] -> np.ndarray(int, shape=(4,))
+                "q_by_tc": q_partial,  # dict[int] -> dict[state] -> np.ndarray(float, shape=(4,))
             }
             out_q.put_nowait(payload)
 
@@ -182,17 +226,16 @@ def worker_proc(wid: int, cfg: dict, out_q: mp.Queue, stop_ev: mp.Event):
             "wins": wins,
             "push": pushes,
             "loss": losses,
-            # Garder les arrays:
-            "visits_add": v_add,        # dict[int] -> dict[state] -> np.ndarray(int, shape=(4,))
-            "q_by_tc": q_partial,       # dict[int] -> dict[state] -> np.ndarray(float, shape=(4,))
+            "visits_add": v_add,
+            "q_by_tc": q_partial,
         }
         out_q.put_nowait(payload)
 
     out_q.put({"type": "done", "worker": wid})
 
+
 # --------------------- Master merge ---------------------
 def merge_update_into_master(master: QTable, upd: dict):
-    # episodes & stats handled outside
     # For each (tc, state), update visits and do per-action weighted average of Q
     for tc, dd in upd["visits_add"].items():
         for s, v_add_list in dd.items():
@@ -212,6 +255,7 @@ def merge_update_into_master(master: QTable, upd: dict):
             master.q_by_tc[tc][s] = q_m
             master.visits_by_tc[tc][s] = tot
 
+
 def master_loop(args):
     # load / init
     master = load_qtable(args.save_path) if (args.resume and os.path.exists(args.save_path)) else QTable()
@@ -221,6 +265,9 @@ def master_loop(args):
     stop_ev = mp.Event()
 
     resume_dict = qtable_to_dict(master) if args.resume and master.episodes > 0 else None
+
+    # parse tc-only filter once here, pass to workers
+    tc_only = parse_tc_only(args.tc_only)
 
     # start workers
     workers = []
@@ -233,6 +280,7 @@ def master_loop(args):
             epsilon=args.epsilon,
             report_eps=args.report_eps,
             resume_dict=resume_dict,
+            tc_only=tc_only,  # << NEW
         )
         p = mp.Process(target=worker_proc, args=(wid, cfg, out_q, stop_ev), daemon=True)
         p.start()
@@ -240,7 +288,7 @@ def master_loop(args):
 
     # stats & timers
     total_target = args.episodes
-    total_eps = int(master.episodes)
+    total_eps = int(master.episodes)  # counts trained episodes only
     wins = pushes = losses = 0
     returns_sum = 0.0
 
@@ -253,6 +301,7 @@ def master_loop(args):
     def handle_sigint(sig, frame):
         print("\n[!] Ctrl+C → arrêt des workers…")
         stop_ev.set()
+
     signal.signal(signal.SIGINT, handle_sigint)
 
     done_workers = 0
@@ -272,7 +321,7 @@ def master_loop(args):
             if msg["type"] == "update":
                 # merge Q + visits
                 merge_update_into_master(master, msg)
-                # global counters
+                # global counters (trained episodes only)
                 total_eps += int(msg["episodes"])
                 returns_sum += float(msg["returns_sum"])
                 wins += int(msg["wins"])
@@ -287,7 +336,6 @@ def master_loop(args):
         now = time.perf_counter()
         if (now - t_last) >= args.log_every:
             dt = now - t_last
-            # crude eps/s since last log
             eps_delta = total_eps - getattr(master, "_last_log_eps", total_eps)
             eps_per_s = eps_delta / max(1e-9, dt)
             total = max(1, wins + pushes + losses)
@@ -295,8 +343,10 @@ def master_loop(args):
             pushp = 100.0 * pushes / total
             lossp = 100.0 * losses / total
             ev = returns_sum / max(1, total_eps if total_eps > 0 else 1)
-            print(f"[{total_eps:,} eps] 👷×{args.workers}  ⚡ {eps_per_s:,.0f} eps/s | "
-                  f"EV/round={ev:+.4f} | W/P/L: {winp:.1f}%/{pushp:.1f}%/{lossp:.1f}%")
+            print(
+                f"[{total_eps:,} eps] 👷×{args.workers}  ⚡ {eps_per_s:,.0f} eps/s | "
+                f"EV/round={ev:+.4f} | W/P/L: {winp:.1f}%/{pushp:.1f}%/{lossp:.1f}%"
+            )
             master._last_log_eps = total_eps
             t_last = now
 
@@ -318,6 +368,7 @@ def master_loop(args):
     save_qtable(master, args.save_path)
     print(f"✅ Fin. Q-table sauvegardée dans {args.save_path} @ {total_eps:,} eps")
 
+
 # --------------------- CLI ---------------------
 def main():
     ap = argparse.ArgumentParser(description="Free Bet Blackjack RL - multi-process trainer")
@@ -325,23 +376,36 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--alpha", type=float, default=0.05)
     ap.add_argument("--epsilon", type=float, default=0.20)
-    ap.add_argument("--gamma", type=float, default=1.0)  # si utilisé dans QTable
-    ap.add_argument("--episodes", type=int, default=5_000_000, help="0 = infini")
-    ap.add_argument("--report-eps", type=int, default=50_000, help="Épisodes entre deux rapports worker→maître")
+    ap.add_argument("--gamma", type=float, default=1.0, help="Si utilisé dans QTable")
+    ap.add_argument("--episodes", type=int, default=5_000_000, help="0 = infini (compte les épisodes entraînés)")
+    ap.add_argument("--report-eps", type=int, default=50_000, help="Mains jouées entre deux rapports worker→maître")
     ap.add_argument("--autosave-secs", type=float, default=60.0)
     ap.add_argument("--log-every", type=float, default=2.0)
     ap.add_argument("--num-decks", type=int, default=8)
     ap.add_argument("--penetration", type=float, default=0.5)
     ap.add_argument("--h17", action="store_true")
     ap.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1))
+
+    # NEW: filter training to specific true counts
+    ap.add_argument(
+        "--tc-only",
+        type=str,
+        default="",
+        help="Liste de TC à entraîner (CSV ou range a:b). Ex: '4,5' ou '4:5'. Vide = tous."
+    )
+
     args = ap.parse_args()
 
     # Windows: spawn
     if sys.platform.startswith("win"):
         mp.set_start_method("spawn", force=True)
 
-    print(f"🚀 MP training: workers={args.workers}, report_eps={args.report_eps:,}, autosave={int(args.autosave_secs)}s")
+    print(
+        f"🚀 MP training: workers={args.workers}, report_eps={args.report_eps:,}, "
+        f"autosave={int(args.autosave_secs)}s, tc_only={parse_tc_only(args.tc_only)}"
+    )
     master_loop(args)
+
 
 if __name__ == "__main__":
     main()
